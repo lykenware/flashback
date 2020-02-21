@@ -1,4 +1,7 @@
 use crate::timeline::Frame;
+use avm1_parser::parse_cfg;
+use avm1_types::cfg::{Action, Cfg, CfgBlock, CfgFlow};
+use avm1_types::PushValue;
 
 #[derive(Clone, Debug)]
 pub enum Value {
@@ -54,19 +57,13 @@ pub struct Code {
 }
 
 impl Code {
-    pub fn parse_and_compile(mut data: &[u8]) -> Self {
-        let mut actions = vec![];
-        while data[0] != 0 {
-            let (rest, action) = avm1_parser::parse_action(data).unwrap();
-            data = rest;
-            actions.push(action);
-        }
-        assert_eq!(data, [0]);
+    pub fn parse_and_compile(data: &[u8]) -> Self {
+        let cfg = parse_cfg(data);
 
-        Code::compile(actions)
+        Code::compile(cfg)
     }
 
-    pub fn compile(actions: Vec<avm1_tree::Action>) -> Self {
+    pub fn compile(cfg: Cfg) -> Self {
         let mut consts = vec![];
         let mut regs = vec![];
         let mut stack = vec![];
@@ -77,48 +74,44 @@ impl Code {
         regs.push(Value::Undefined);
         regs.pop();
 
-        for action in actions {
+        // FIXME(demurgos) Handle control flow, we're currently only compiling the first block
+        let block: CfgBlock = cfg.blocks.into_vec().remove(0);
+
+        for action in block.actions {
             match action {
-                avm1_tree::Action::Play => ops.push(Op::Play),
-                avm1_tree::Action::Stop => ops.push(Op::Stop),
-                avm1_tree::Action::GotoFrame(goto) => {
+                Action::Play => ops.push(Op::Play),
+                Action::Stop => ops.push(Op::Stop),
+                Action::GotoFrame(goto) => {
                     ops.push(Op::GotoFrame(Frame(goto.frame as u16)));
                 }
-                avm1_tree::Action::GotoLabel(goto) => {
+                Action::GotoLabel(goto) => {
                     ops.push(Op::GotoLabel(goto.label));
                 }
-                avm1_tree::Action::GetUrl(get_url) => {
+                Action::GetUrl(get_url) => {
                     ops.push(Op::GetUrl(get_url.url, get_url.target));
                 }
-
-                // All of frames are loaded ahead of time, no waiting needed.
-                avm1_tree::Action::WaitForFrame(_) => {}
-                avm1_tree::Action::WaitForFrame2(_) => {
-                    stack.pop();
+                Action::ConstantPool(pool) => {
+                    consts = pool.pool;
                 }
-
-                avm1_tree::Action::ConstantPool(pool) => {
-                    consts = pool.constant_pool;
-                }
-                avm1_tree::Action::Push(push) => {
+                Action::Push(push) => {
                     stack.extend(push.values.into_iter().map(|value| match value {
-                        avm1_tree::Value::Undefined => Value::Undefined,
-                        avm1_tree::Value::Null => Value::Null,
-                        avm1_tree::Value::Boolean(x) => Value::Bool(x),
-                        avm1_tree::Value::Sint32(x) => Value::I32(x),
-                        avm1_tree::Value::Float32(x) => Value::F32(x),
-                        avm1_tree::Value::Float64(x) => Value::F64(x),
-                        avm1_tree::Value::String(s) => Value::Str(s),
+                        PushValue::Undefined => Value::Undefined,
+                        PushValue::Null => Value::Null,
+                        PushValue::Boolean(x) => Value::Bool(x),
+                        PushValue::Sint32(x) => Value::I32(x),
+                        PushValue::Float32(x) => Value::F32(x),
+                        PushValue::Float64(x) => Value::F64(x),
+                        PushValue::String(s) => Value::Str(s),
 
                         // FIXME(eddyb) avoid per-use cloning.
-                        avm1_tree::Value::Constant(i) => Value::Str(consts[i as usize].to_string()),
-                        avm1_tree::Value::Register(i) => regs[i as usize].clone(),
+                        PushValue::Constant(i) => Value::Str(consts[i as usize].to_string()),
+                        PushValue::Register(i) => regs[i as usize].clone(),
                     }));
                 }
-                avm1_tree::Action::Pop => {
+                Action::Pop => {
                     stack.pop();
                 }
-                avm1_tree::Action::GetVariable => match stack.pop().unwrap() {
+                Action::GetVariable => match stack.pop().unwrap() {
                     Value::Str(name) => {
                         ops.push(Op::GetVar(name));
                         stack.push(Value::OpRes(ops.len() - 1));
@@ -128,7 +121,7 @@ impl Code {
                         break;
                     }
                 },
-                avm1_tree::Action::SetVariable => {
+                Action::SetVariable => {
                     let value = stack.pop().unwrap();
                     match stack.pop().unwrap() {
                         Value::Str(name) => {
@@ -141,7 +134,7 @@ impl Code {
                         }
                     }
                 }
-                avm1_tree::Action::CallFunction => {
+                Action::CallFunction => {
                     let name = stack.pop().unwrap();
                     let arg_count = stack.pop().unwrap();
                     match (name, arg_count.as_i32()) {
@@ -160,7 +153,7 @@ impl Code {
                         }
                     }
                 }
-                avm1_tree::Action::CallMethod => {
+                Action::CallMethod => {
                     let mut name = stack.pop().unwrap();
                     let this = stack.pop().unwrap();
                     let arg_count = stack.pop().unwrap();
@@ -192,6 +185,17 @@ impl Code {
                     eprintln!("unknown action: {:?}", action);
                     break;
                 }
+            }
+        }
+
+        match block.flow {
+            // All of frames are loaded ahead of time, no waiting needed.
+            CfgFlow::WaitForFrame(_) => {}
+            CfgFlow::WaitForFrame2(_) => {
+                stack.pop();
+            }
+            _ => {
+                eprintln!("unknown flow: {:?}", block.flow);
             }
         }
 
